@@ -308,7 +308,7 @@ struct ActorCriticImpl : torch::nn::Module {
 TORCH_MODULE(ActorCritic);
 
 
-~LP_Plugin_Sac()
+~Sac()
 {
     gQuit = true;
     gFuture.waitForFinished();
