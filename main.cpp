@@ -1,9 +1,4 @@
-#include "lp_plugin_sac.h"
-
-#include "lp_renderercam.h"
-#include "lp_openmesh.h"
-#include "renderer/lp_glselector.h"
-#include "renderer/lp_glrenderer.h"
+#include "sac.h"
 
 #include <math.h>
 #include <fstream>
@@ -30,7 +25,7 @@
 
 # define M_PI 3.14159265358979323846  /* pi */
 
-//tensorboard --logdir /home/cpii/projects/log/gym_1d_vision/test8
+//tensorboard --logdir "path"
 const std::string kLogFile = "path";
 
 const QString memoryPath("path");
