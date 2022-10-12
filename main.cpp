@@ -1,55 +1,55 @@
-#include <torch/torch.h>
-#include <torch/script.h>
+#include "lp_plugin_sac.h"
 
-#include <QCoreApplication>
+#include "lp_renderercam.h"
+#include "lp_openmesh.h"
+#include "renderer/lp_glselector.h"
+#include "renderer/lp_glrenderer.h"
 
-#include <tensorboard_logger.h>
-
-#include <Eigen/Core>
-#include <string>
-#include <tuple>
-#include "gym/gym.h"
-
-#include <filesystem>
-#include <memory>
 #include <math.h>
-#include <QProcess>
-#include <QFile>
-#include <QTextStream>
-#include <QThread>
-#include <QDebug>
+#include <fstream>
+#include <filesystem>
+
+#include <QVBoxLayout>
+#include <QMouseEvent>
+#include <QOpenGLContext>
+#include <QOpenGLShaderProgram>
+#include <QOpenGLExtraFunctions>
+#include <QLabel>
+#include <QMatrix4x4>
+#include <QPushButton>
+#include <QtConcurrent/QtConcurrent>
+#include <QFileDialog>
+#include <QPainter>
 
 #include <gym_torch.cpp>
 
+
+/**
+ * @brief BulletPhysics Headers
+ */
+
 # define M_PI 3.14159265358979323846  /* pi */
 
-const QString memoryPath("/home/cpii/projects/test_memory");
-const QString modelPath("/home/cpii/storage_d1/RL1/SAC/test/models");
+//tensorboard --logdir /home/cpii/projects/log/gym_1d_vision/test8
+const std::string kLogFile = "path";
 
-const QString testdataPath("/home/cpii/storage_d1/RL1/SAC/Python_test_data2/testdata");
-const QString traindataPath("/home/cpii/storage_d1/RL1/SAC/Python_test_data2/traindata");
-const QString testmodelPath("/home/cpii/storage_d1/RL1/SAC/Python_test_data2/initmodel");
-const QString trainrsamplePath("/home/cpii/storage_d1/RL1/SAC/Python_test_data2/eps");
+const QString memoryPath("path");
+const QString modelPath("path");
 
-int maxepisode = 10000, maxstep = 4000, batch_size = 8, epsid = 0;
+int maxepisode = 100000, maxstep = 500, batch_size = 256, total_test_episode = 5;
 const float ALPHA = 0.2, GAMMA = 0.99, POLYAK = 0.995;
-const int LOG_SIG_MIN = -2, LOG_SIG_MAX = 20, EXPLORE = 10000, STATE_DIM = 3, ACT_DIM = 1;
+const int LOG_SIG_MIN = -2, LOG_SIG_MAX = 20, EXPLORE = 10000, SAVEMODELEVERY = 500, START_STEP = 2000;
+const double x_threshold = 4 * 2.4;
+int STATE_DIM = 1568, ACT_DIM = 1;
 float lrp = 1e-3, lrc = 1e-3;
-int traincount = 0, testcount = 0, rsamplecount = 0;
+bool gg = false;
+torch::Tensor tmp_state;
+
+QFuture<void> gFuture;
+QReadWriteLock gLock;
+QImage gImage;
 
 torch::Device device(torch::kCPU);
-
-bool Evaluate = false;
-
-std::vector<char> get_the_bytes(std::string filename) {
-    std::ifstream input(filename, std::ios::binary);
-    std::vector<char> bytes(
-        (std::istreambuf_iterator<char>(input)),
-        (std::istreambuf_iterator<char>()));
-
-    input.close();
-    return bytes;
-}
 
 auto build_fc_layers (std::vector<int> dims) {
         torch::nn::Sequential layers;
@@ -67,12 +67,10 @@ auto build_fc_layers (std::vector<int> dims) {
 // Memory
 struct Data {
     torch::Tensor before_state;
-    torch::Tensor before_pick_point;
-    torch::Tensor place_point;
+    torch::Tensor after_state;
+    torch::Tensor action;
     torch::Tensor reward;
     torch::Tensor done;
-    torch::Tensor after_state;
-    torch::Tensor after_pick_point;
 };
 std::deque<Data> memory;
 
@@ -82,10 +80,17 @@ struct policy_output
     torch::Tensor logp_pi;
 };
 
-
 struct PolicyImpl : torch::nn::Module {
-    PolicyImpl(std::vector<int> fc_dims) {
-        //conv = register_module("conv", torch::nn::ConvTranspose2d(1, 2, 3));
+    PolicyImpl(std::vector<int> fc_dims)
+        : conv1(torch::nn::Conv2dOptions(2, 16, 5).stride(2).padding(2).bias(false)),
+          conv2(torch::nn::Conv2dOptions(16, 32, 3).stride(2).padding(1).bias(false)),
+          conv3(torch::nn::Conv2dOptions(64, 64, 3).stride(1).padding(1).bias(false)),
+          maxpool(torch::nn::MaxPool2dOptions(3).stride({2, 2}))
+    {
+        register_module("conv1", conv1);
+        register_module("conv2", conv2);
+        register_module("conv3", conv3);
+        register_module("maxpool", maxpool);
         mlp = register_module("mlp", build_fc_layers(fc_dims));
         mlp->push_back(torch::nn::ReLUImpl());
         mean_linear = register_module("mean_linear", torch::nn::Linear(fc_dims[fc_dims.size()-1], ACT_DIM));
@@ -93,117 +98,193 @@ struct PolicyImpl : torch::nn::Module {
     }
 
     policy_output forward(torch::Tensor state, bool deterministic, bool log_prob) {
-        //torch::Tensor x = conv(state);
+//        torch::Tensor x = state;
+        torch::Tensor x = conv1(state); // 510*510
 
-        torch::Tensor netout = mlp->forward(state);
+        //std::cout << "x: " << x.sizes() << std::endl;
 
-//        std::cout << "mlp para: " << std::endl << mlp->parameters()[0].mean() << std::endl;
-//        std::cout << "mlp: " << netout.mean() << std::endl;
+        x = torch::relu(maxpool(x)); // 254*254
 
-        //x = torch::sigmoid(x);
+        //std::cout << "x: " << x.sizes() << " " << x.dtype() << std::endl;
+
+//        torch::Tensor out_tensor1 = x;
+//        out_tensor1 = out_tensor1.index({0, 14}).to(torch::kF32).clone().detach().to(torch::kCPU);
+//        std::cout << "out_tensor1: " << out_tensor1.sizes() << " " << out_tensor1.dtype() << std::endl;
+//        cv::Mat cv_mat1(254, 254, CV_32FC1, out_tensor1.data_ptr());
+//        auto min1 = out_tensor1.min().item().toFloat();
+//        auto max1 = out_tensor1.max().item().toFloat();
+//        std::cout << "min1: " << min1 << "max1: " << max1 << std::endl;
+//        cv_mat1.convertTo(cv_mat1, CV_8U, 255.0/(max1-min1));
+//        std::cout << cv_mat1.type() << std::endl;
+//        cv::cvtColor(cv_mat1, cv_mat1, CV_GRAY2BGR);
+
+        x = conv2(x); // 254*254
+
+        //std::cout << "x: " << x.sizes() << std::endl;
+
+        x = torch::relu(maxpool(x)); // 126*126
+
+        //std::cout << "x: " << x.sizes() << std::endl;
+
+//        torch::Tensor out_tensor2 = x*255;
+//        out_tensor2 = out_tensor2.index({0, 3}).to(torch::kF32).clone().detach().to(torch::kCPU);
+//        std::cout << "out_tensor2: " << out_tensor2.sizes() << " " << out_tensor2.dtype() << std::endl;
+//        cv::Mat cv_mat2(126, 126, CV_32FC1, out_tensor2.data_ptr());
+//        auto min2 = out_tensor2.min().item().toFloat();
+//        auto max2 = out_tensor2.max().item().toFloat();
+//        std::cout << "min2: " << min2 << "max2: " << max2 << std::endl;
+//        cv_mat2.convertTo(cv_mat2, CV_8U);
+//        cv::cvtColor(cv_mat2, cv_mat2, CV_GRAY2BGR);
+
+        //x = conv3(x); // 126*126
+
+        //std::cout << "x: " << x.sizes() << std::endl;
+
+        //x = torch::relu(maxpool(x)); // 62*62
+
+        //std::cout << "x: " << x.sizes() << std::endl;
+
+//        torch::Tensor out_tensor3 = x*255;
+//        out_tensor3 = out_tensor3.index({0, 2}).to(torch::kF32).clone().detach().to(torch::kCPU);
+//        std::cout << "out_tensor3: " << out_tensor3.sizes() << " " << out_tensor3.dtype() << std::endl;
+//        cv::Mat cv_mat3(62, 62, CV_32FC1, out_tensor3.data_ptr());
+//        auto min3 = out_tensor3.min().item().toFloat();
+
+//        auto max3 = out_tensor3.max().item().toFloat();
+//        std::cout << "min3: " << min3 << "max3: " << max3 << std::endl;
+//        cv_mat3.convertTo(cv_mat3, CV_8U);
+//        cv::cvtColor(cv_mat3, cv_mat3, CV_GRAY2BGR);
+
+        //std::cout << cv_mat1.size() << " " << cv_mat2.size() << " " << cv_mat3.size() << std::endl;
+
+//        gLock.lockForWrite();
+//        gWarpedImage = QImage((uchar*) cv_mat1.data, cv_mat1.cols, cv_mat1.rows, cv_mat1.step, QImage::Format_BGR888).copy();
+//        gInvWarpImage = QImage((uchar*) cv_mat2.data, cv_mat2.cols, cv_mat2.rows, cv_mat2.step, QImage::Format_BGR888).copy();
+//        gEdgeImage = QImage((uchar*) cv_mat3.data, cv_mat3.cols, cv_mat3.rows, cv_mat3.step, QImage::Format_BGR888).copy();
+//        gLock.unlock();
+
+        x = x.view({x.size(0), -1});
+
+        //std::cout << "x: " << x.sizes() << std::endl;
+
+        torch::Tensor netout = mlp->forward(x);
 
         torch::Tensor mean = mean_linear(netout);
 
-//        std::cout << "mean para: " << std::endl << mean_linear->parameters()[0].mean() << std::endl;
-//        std::cout << "mean: " << mean.mean() << std::endl;
-
         torch::Tensor log_std = log_std_linear(netout);
-
-//        std::cout << "std para: " << std::endl << log_std_linear->parameters()[0].mean() << std::endl;
-//        std::cout << "std: " << log_std.mean() << std::endl;
 
         log_std = torch::clamp(log_std, LOG_SIG_MIN, LOG_SIG_MAX);
 
         torch::Tensor std = log_std.exp();
 
-
-//        std::cout << "mean: " << std::endl << mean << std::endl;
-//        std::cout << "log_std: " << std::endl << log_std << std::endl;
-//        std::cout << "std: " << std::endl << std << std::endl;
-//        std::cout << "shape: " << std::endl << shape << std::endl;
-//        std::cout << "pi d: " << std::endl << pi_distribution << std::endl;
-
         torch::Tensor action;
-        torch::Tensor rsample;
         if(deterministic){
             // Only used for evaluating policy at test time.
             action = mean;
         } else {
             auto shape = mean.sizes();
             auto eps = torch::randn(shape) * torch::ones(shape, mean.dtype()) + torch::zeros(shape, mean.dtype());
-//            std::cout << "eps: " << std::endl << eps << std::endl;
+            action = mean + std * eps.to(device);  // for reparameterization trick (mean + std * N(0,1))
 
-
-//            QString path = QString(trainrsamplePath + "/%1").arg(epsid);
-//            epsid++;
-//            // Load values by name
-//            std::vector<char> f = get_the_bytes(QString(path + "/eps.pt").toStdString());
-//            torch::IValue stateI = torch::pickle_load(f);
-//            torch::Tensor eps = stateI.toTensor().detach().to(device);
-
-            rsample = mean + std * eps;  // for reparameterization trick (mean + std * N(0,1))
-
-            action = rsample;
-            //std::cout << "rsample: " << std::endl << rsample << std::endl;
+//            auto eps = at::normal(0, 1, mean.sizes()).to(mean.device());
+//            eps.set_requires_grad(false);
+//            action = mean + eps * std;// for reparameterization trick (mean + std * N(0,1))
         }
+
+        //# action rescaling
+//        torch::Tensor action_scale = torch::ones({1}).to(device) * 1.0;
+//        torch::Tensor action_bias = torch::ones({1}).to(device) * 0.0;
+
+//        static auto logSqrt2Pi = torch::zeros({1}).to(mean.device());
+//        static std::once_flag flag;
+//        std::call_once(flag, [](){
+//            logSqrt2Pi[0] = 2*M_PI;
+//            logSqrt2Pi = torch::log(torch::sqrt(logSqrt2Pi));
+//        });
+//        static auto log_prob_func = [](torch::Tensor value, torch::Tensor mean, torch::Tensor std){
+//            auto var = std.pow(2);
+//            auto log_scale = std.log();
+//            return -(value - mean).pow(2) / (2 * var) - log_scale - logSqrt2Pi;
+//        };
 
         torch::Tensor logp_pi;
         if(log_prob){
             // Calculate log_prob
             auto var = pow(std, 2);
             auto log_scale = log(std);
-
             logp_pi = -pow(action - mean, 2) / (2.0 * var) - log_scale - log(sqrt(2.0 * M_PI));
-
-            //std::cout << "-pow(action - std, 2): " << std::endl << -pow(action - mean, 2) << std::endl;
-            //std::cout << "log(sqrt(2.0 * M_PI)): " << std::endl << log(sqrt(2.0 * M_PI)) << std::endl;
 
             // Enforcing Action Bound
             logp_pi = logp_pi.sum(-1);
-            //std::cout << "log prob: " << std::endl << logp_pi << std::endl;
             logp_pi -= torch::sum(2.0 * (log(2.0) - action - torch::nn::functional::softplus(-2.0 * action)), 1);
-            //std::cout << "log prob softplus: " << std::endl << logp_pi << std::endl;
+            logp_pi = torch::unsqueeze(logp_pi, -1);
+
+//            logp_pi = log_prob_func(action, mean, std);
+//            // Enforcing Action Bound
+//            logp_pi -= torch::log(action_scale * (1 - torch::tanh(action).pow(2)) + 1e-6);
+//            logp_pi = logp_pi.sum(1, true);
         } else {
-            logp_pi = torch::zeros(1);
+            logp_pi = torch::zeros(1).to(device);
         }
 
+        //action = torch::tanh(action) * action_scale + action_bias;
         action = torch::tanh(action);
-
-        //std::cout << "action tanh: " << std::endl << action << std::endl;
-
-        float ACT_LIMIT = 3.0;
-        action = action * ACT_LIMIT;
 
         policy_output output = {action, logp_pi};
 
         return output;
     }
-
-    //torch::nn::ConvTranspose2d conv{nullptr};
     torch::nn::Sequential mlp{nullptr};
+    torch::nn::Conv2d conv1{nullptr}, conv2{nullptr}, conv3{nullptr};
+    torch::nn::MaxPool2d maxpool;
     torch::nn::Linear mean_linear{nullptr}, log_std_linear{nullptr};
 };
 TORCH_MODULE(Policy);
 
 
 struct MLPQFunctionImpl : torch::nn::Module {
-    MLPQFunctionImpl(std::vector<int> fc_dims) {
-        //conv = register_module("conv", torch::nn::ConvTranspose2d(1, 2, 3));
+    MLPQFunctionImpl(std::vector<int> fc_dims)
+        : conv1(torch::nn::Conv2dOptions(2, 16, 5).stride(2).padding(2).bias(false)),
+          conv2(torch::nn::Conv2dOptions(16, 32, 3).stride(2).padding(1).bias(false)),
+          conv3(torch::nn::Conv2dOptions(64, 64, 3).stride(1).padding(1).bias(false)),
+          maxpool(torch::nn::MaxPool2dOptions(3).stride({2, 2}))
+    {
+        register_module("conv1", conv1);
+        register_module("conv2", conv2);
+        register_module("conv3", conv3);
+        register_module("maxpool", maxpool);
         fc_dims.push_back(1);
         q = register_module("q", build_fc_layers(fc_dims));
     }
 
     torch::Tensor forward(torch::Tensor state, torch::Tensor action){
-        //torch::Tensor x = conv(state);
+//        torch::Tensor x = state;
+        torch::Tensor x = conv1(state); //
 
-        torch::Tensor x = q->forward(torch::cat({state, action}, -1));
+        x = torch::relu(maxpool(x)); //
 
-        x = torch::squeeze(x, -1);
+        x = conv2(x); // 254*254
+
+        x = torch::relu(maxpool(x)); //
+
+//        x = conv3(x); // 126*126
+
+//        x = torch::relu(maxpool(x)); // 62*62
+
+        x = x.view({x.size(0), -1});
+
+//        x = torch::cat({x, pick_point}, -1); // 62*62*4+3 = 15379
+
+        //std::cout << "x: " << x.sizes() << std::endl;
+
+        x = q->forward(torch::cat({x, action}, -1));
+
+        //x = torch::squeeze(x, -1);
 
         return x;
     }
-
-    //torch::nn::ConvTranspose2d conv{nullptr};
+    torch::nn::Conv2d conv1{nullptr}, conv2{nullptr}, conv3{nullptr};
+    torch::nn::MaxPool2d maxpool;
     torch::nn::Sequential q{nullptr};
 };
 TORCH_MODULE(MLPQFunction);
@@ -223,8 +304,6 @@ struct ActorCriticImpl : torch::nn::Module {
 
         torch::Tensor action = p.action;
 
-        //std::cout << "action: " << std::endl << action << std::endl;
-
         return action;
     }
 
@@ -233,6 +312,42 @@ struct ActorCriticImpl : torch::nn::Module {
 };
 TORCH_MODULE(ActorCritic);
 
+
+~LP_Plugin_Sac()
+{
+    gQuit = true;
+    gFuture.waitForFinished();
+}
+
+class Sleeper : public QThread
+{
+public:
+    static void usleep(unsigned long usecs){QThread::usleep(usecs);}
+    static void msleep(unsigned long msecs){QThread::msleep(msecs);}
+    static void sleep(unsigned long secs){QThread::sleep(secs);}
+};
+
+bool Run()
+{
+    mLabel->setText("Left click to start training");
+
+//    mCart_posi = 0;
+
+//    bool b2D = false;
+//    CartPole_Continous Env(b2D);
+//    Env.reset();
+//    for(int i=0; i<50; i++){
+//        auto action = Env.sample_action();
+//        std::cout << "act: " << action << std::endl;
+//        auto out = Env.step(action);
+//        std::cout << "mState: " << std::get<0>(out) << ", "
+//                  << "reward: " << std::get<1>(out) << ", "
+//                  << "done: " << std::get<2>(out) << ", "
+//                  << "tmp: " << std::get<3>(out) << ", " << std::endl;
+//    }
+
+    return false;
+}
 
 void savedata(QString fileName, std::vector<float> datas){
     std::vector<std::string> data_string;
@@ -246,6 +361,7 @@ void savedata(QString fileName, std::vector<float> datas){
     std::ofstream output_file(filenamecc);
     std::ostream_iterator<std::string> output_iterator(output_file, "\n");
     std::copy(data_string.begin(), data_string.end(), output_iterator);
+    output_file.close();
 }
 
 void loaddata(std::string fileName, std::vector<float> &datas){
@@ -271,729 +387,419 @@ void loaddata(std::string fileName, std::vector<float> &datas){
     in.close();
 }
 
-int main(int argc, char *argv[])
-{
-//    std::vector<float> tt{1, 1, 1, 1, 2, 2, 2, 2};
-//    auto s_batch = torch::from_blob(tt.data(), { 2, 2, 2 }, at::kFloat);
-//    std::cout << "s_batch: " << std::endl << s_batch << std::endl;
-//    s_batch = s_batch.flatten(1);
-//    std::cout << "s_batch: " << std::endl << s_batch << std::endl;
+void Reinforcement_Learning(){
+//    for(int i=0; i <10000; i++){
+//        QString filename_id = QString(memoryPath + "/%1").arg(i);
 
-//    std::vector<float> tt2{3, 3, 3, 3};
-//    auto a_batch = torch::from_blob(tt2.data(), {1, 2, 2 }, at::kFloat);
-//    std::cout << "a_batch: " << std::endl << a_batch << std::endl;
-//    a_batch = a_batch.flatten(1);
-//    std::cout << "a_batch: " << std::endl << a_batch << std::endl;
+//        torch::Tensor before_state_CPU;
+//        QString filename_before_state = QString(filename_id + "/before_state.pt");
+//        torch::load(before_state_CPU, filename_before_state.toStdString());
 
-//    torch::Tensor cat = torch::cat({s_batch, a_batch}, 0);
-//    std::cout << "cat: " << std::endl << cat << std::endl;
+//        torch::Tensor after_state_CPU;
+//        QString filename_after_state = QString(filename_id + "/after_state.pt");
+//        torch::load(after_state_CPU, filename_after_state.toStdString());
 
-//    cat = torch::reshape(cat, {3, 2, 2});
-//    std::cout << "cat: " << std::endl << cat << std::endl;
+//        torch::Tensor action_CPU;
+//        QString filename_action = QString(filename_id + "/action.pt");
+//        torch::load(action_CPU, filename_action.toStdString());
 
-//    return 0;
+//        torch::Tensor reward_CPU;
+//        QString filename_reward = QString(filename_id + "/reward.pt");
+//        torch::load(reward_CPU, filename_reward.toStdString());
 
-//    QString m1 = QString(testmodelPath + "/para%1.pt").arg(0);
-//    QString m2 = QString(testmodelPath + "/para%1.pt").arg(1);
-//    // Load values by name
-//    std::vector<char> f = get_the_bytes(m1.toStdString());
-//    torch::IValue m1I = torch::pickle_load(f);
-//    torch::Tensor m1T = m1I.toTensor();
+//        torch::Tensor done_CPU;
+//        QString filename_done = QString(filename_id + "/done.pt");
+//        torch::load(done_CPU, filename_done.toStdString());
 
-//    std::vector<char> f2 = get_the_bytes(m2.toStdString());
-//    torch::IValue m2I = torch::pickle_load(f2);
-//    torch::Tensor m2T = m2I.toTensor();
-
-
-//    std::cout << "m1: " << std::endl << m1T << std::endl;
-//    std::cout << "m2: " << std::endl << m2T << std::endl;
-
-
-//    for (const auto & file : std::filesystem::directory_iterator(traindataPath.toStdString())){
-//        traincount++;
-//    }
-//    for (const auto & file : std::filesystem::directory_iterator(testdataPath.toStdString())){
-//        testcount++;
-//    }
-//    qDebug() << "traincount: " << traincount;
-//    qDebug() << "testcount: " << testcount;
-
-//    for(int i=testcount-4000; i<testcount; i++){
-//        QString path = QString(trainrsamplePath + "/%1").arg(i);
-//        // Load values by name
-//        std::vector<char> f = get_the_bytes(QString(path + "/rsample.pt").toStdString());
-//        torch::IValue stateI = torch::pickle_load(f);
-//        auto rsample = stateI.toTensor().to(device);
-
-//        std::cout << rsample << std::endl;
-
-//        QString tpath = QString(testdataPath + "/%1").arg(i);
-//        // Load values by name
-//        std::vector<char> f2 = get_the_bytes(QString(tpath + "/action.pt").toStdString());
-//        torch::IValue stateI2 = torch::pickle_load(f2);
-//        auto statet = stateI2.toTensor().to(device);
-
-//        std::cout << statet << std::endl;
-
-
-//        QString rpath = QString(traindataPath + "/%1").arg(i);
-//        // Load values by name
-//        std::vector<char> f3 = get_the_bytes(QString(rpath + "/action.pt").toStdString());
-//        torch::IValue stateI3 = torch::pickle_load(f3);
-//        auto stater = stateI3.toTensor().to(device);
-
-//        std::cout << stater << std::endl;
-
-//        QString state_path = QString(testdataPath + "/%1/state.pt").arg(0);
-//        QString action_path = QString(testdataPath + "/%1/action.pt").arg(0);
-//        // Load values by name
-//        std::vector<char> f = get_the_bytes(state_path.toStdString());
-//        torch::IValue state = torch::pickle_load(f);
-//        torch::Tensor statet = state.toTensor();
-
-//        std::vector<char> f2 = get_the_bytes(action_path.toStdString());
-//        torch::IValue action = torch::pickle_load(f2);
-//        torch::Tensor actiond = action.toTensor();
-
-//        std::cout << "state: " << statet << std::endl;
-//        std::cout << "ad: " << actiond << std::endl;
+//        std::cout << "before_state_CPU: " << before_state_CPU.mean() << std::endl
+//                  << "after_state_CPU: " << after_state_CPU.mean() << std::endl
+//                  << "action_CPU: " << action_CPU << std::endl
+//                  << "reward_CPU: " << reward_CPU << std::endl
+//                  << "done_CPU: " << done_CPU << std::endl;
 //    }
 
+//    return;
 
-    for (const auto & file : std::filesystem::directory_iterator(traindataPath.toStdString())){
-        traincount++;
-    }
-    for (const auto & file : std::filesystem::directory_iterator(testdataPath.toStdString())){
-        testcount++;
-    }
-    qDebug() << "traincount: " << traincount;
-    qDebug() << "testcount: " << testcount;
+    auto rl1current = QtConcurrent::run([this](){
+        try {
+            torch::manual_seed(0);
 
-    torch::manual_seed(0);
+            bool b2D = false;
+            CartPole_Continous Env(b2D);
 
-//    if (torch::cuda::is_available()) {
-//        std::cout << "CUDA is available! Training on GPU." << std::endl;
-//        device = torch::Device(torch::kCUDA);
-//    } else {
-//        std::cout << "CUDA is not available! Training on CPU." << std::endl;
-//    }
-
-    //torch::autograd::DetectAnomalyGuard detect_anomaly;
-
-    qDebug() << "Creating models";
-
-    std::vector<int> policy_mlp_dims{STATE_DIM, 4, 4};
-    std::vector<int> critic_mlp_dims{STATE_DIM + ACT_DIM, 4, 4};
-
-    auto actor_critic = ActorCritic(policy_mlp_dims, critic_mlp_dims);
-    auto actor_critic_target = ActorCritic(policy_mlp_dims, critic_mlp_dims);
-
-
-    qDebug() << "Creating optimizer";
-
-    torch::AutoGradMode copy_disable(false);
-//    for(size_t i=0; i<actor_critic->pi->parameters().size(); i++){
-//        QString m = QString(testmodelPath + "/para%1.pt").arg(i);
-//        std::vector<char> f = get_the_bytes(m.toStdString());
-//        torch::IValue I = torch::pickle_load(f);
-//        torch::Tensor t = I.toTensor();
-//        actor_critic->pi->parameters()[i].copy_(t);
-
-//        //std::cout << "p para: " << std::endl << t << std::endl;
-//    }
-
-    std::vector<torch::Tensor> q_params;
-    for(size_t i=0; i<actor_critic->q1->parameters().size(); i++){
-//        QString m = QString(testmodelPath + "/para%1.pt").arg(i + actor_critic->pi->parameters().size());
-//        std::vector<char> f = get_the_bytes(m.toStdString());
-//        torch::IValue I = torch::pickle_load(f);
-//        torch::Tensor t = I.toTensor();
-//        actor_critic->q1->parameters()[i].copy_(t);
-        q_params.push_back(actor_critic->q1->parameters()[i]);
-
-        //std::cout << "q1 para: " << std::endl << t << std::endl;
-    }
-    for(size_t i=0; i<actor_critic->q2->parameters().size(); i++){
-//        QString m = QString(testmodelPath + "/para%1.pt").arg(i + actor_critic->pi->parameters().size() + actor_critic->q1->parameters().size());
-//        std::vector<char> f = get_the_bytes(m.toStdString());
-//        torch::IValue I = torch::pickle_load(f);
-//        torch::Tensor t = I.toTensor();
-//        actor_critic->q2->parameters()[i].copy_(t);
-        q_params.push_back(actor_critic->q2->parameters()[i]);
-
-        //std::cout << "q2 para: " << std::endl << t << std::endl;
-    }
-
-    for(size_t i=0; i < actor_critic_target->pi->parameters().size(); i++){
-        actor_critic_target->pi->parameters()[i].copy_(actor_critic->pi->parameters()[i]);
-        actor_critic_target->pi->parameters()[i].set_requires_grad(false);
-    }
-    for(size_t i=0; i < actor_critic_target->q1->parameters().size(); i++){
-        actor_critic_target->q1->parameters()[i].copy_(actor_critic->q1->parameters()[i]);
-        actor_critic_target->q1->parameters()[i].set_requires_grad(false);
-    }
-    for(size_t i=0; i < actor_critic_target->q2->parameters().size(); i++){
-        actor_critic_target->q2->parameters()[i].copy_(actor_critic->q2->parameters()[i]);
-        actor_critic_target->q2->parameters()[i].set_requires_grad(false);
-    }
-
-    torch::AutoGradMode copy_enable(true);
-
-    torch::optim::Adam policy_optimizer(actor_critic->pi->parameters(), torch::optim::AdamOptions(lrp));
-    torch::optim::Adam critic_optimizer(q_params, torch::optim::AdamOptions(lrc));
-
-    // ------------------------------------------------------------------------------------------------
-//    QString pi_para_path = QString(modelPath + "/pi_para_" + QString::number(0) + ".pt");
-//    QString q1_para_path = QString(modelPath + "/q1_para_" + QString::number(0) + ".pt");
-//    QString q2_para_path = QString(modelPath + "/q2_para_" + QString::number(0) + ".pt");
-//    QString target_pi_para_path = QString(modelPath + "/target_pi_para_" + QString::number(0) + ".pt");
-//    QString target_q1_para_path = QString(modelPath + "/target_q1_para_" + QString::number(0) + ".pt");
-//    QString target_q2_para_path = QString(modelPath + "/target_q2_para_" + QString::number(0) + ".pt");
-//    QString policy_opti_path = QString(modelPath + "/policy_optimizer_" + QString::number(0) + ".pt");
-//    QString critic_opti_path = QString(modelPath + "/critic_optimizer_" + QString::number(0) + ".pt");
-
-//    torch::save(actor_critic->pi->parameters(), pi_para_path.toStdString());
-//    torch::save(actor_critic->q1->parameters(), q1_para_path.toStdString());
-//    torch::save(actor_critic->q2->parameters(), q2_para_path.toStdString());
-//    torch::save(actor_critic_target->pi->parameters(), target_pi_para_path.toStdString());
-//    torch::save(actor_critic_target->q1->parameters(), target_q1_para_path.toStdString());
-//    torch::save(actor_critic_target->q2->parameters(), target_q2_para_path.toStdString());
-//    torch::save(policy_optimizer, policy_opti_path.toStdString());
-//    torch::save(critic_optimizer, critic_opti_path.toStdString());
-
-//    QString pi_para_path = QString(modelPath + "/pi_para_" + QString::number(0) + ".pt");
-//    QString q1_para_path = QString(modelPath + "/q1_para_" + QString::number(0) + ".pt");
-//    QString q2_para_path = QString(modelPath + "/q2_para_" + QString::number(0) + ".pt");
-//    QString target_pi_para_path = QString(modelPath + "/target_pi_para_" + QString::number(0) + ".pt");
-//    QString target_q1_para_path = QString(modelPath + "/target_q1_para_" + QString::number(0) + ".pt");
-//    QString target_q2_para_path = QString(modelPath + "/target_q2_para_" + QString::number(0) + ".pt");
-//    QString policy_opti_path = QString(modelPath + "/policy_optimizer_" + QString::number(0) + ".pt");
-//    QString critic_opti_path = QString(modelPath + "/critic_optimizer_" + QString::number(0) + ".pt");
-
-//    std::vector<torch::Tensor> pi_para, q1_para, q2_para, target_pi_para, target_q1_para, target_q2_para;
-
-//    torch::load(pi_para, pi_para_path.toStdString());
-//    torch::load(q1_para, q1_para_path.toStdString());
-//    torch::load(q2_para, q2_para_path.toStdString());
-//    torch::load(target_pi_para, target_pi_para_path.toStdString());
-//    torch::load(target_q1_para, target_q1_para_path.toStdString());
-//    torch::load(target_q2_para, target_q2_para_path.toStdString());
-//    torch::load(policy_optimizer, policy_opti_path.toStdString());
-//    torch::load(critic_optimizer, critic_opti_path.toStdString());
-
-//    torch::AutoGradMode data_copy_disable(false);
-//    for(size_t i=0; i < actor_critic->pi->parameters().size(); i++){
-//        actor_critic->pi->parameters()[i].copy_(pi_para[i]);
-//    }
-//    for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
-//        actor_critic->q1->parameters()[i].copy_(q1_para[i]);
-//    }
-//    for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
-//        actor_critic->q2->parameters()[i].copy_(q2_para[i]);
-//    }
-//    for(size_t i=0; i < actor_critic->pi->parameters().size(); i++){
-//        actor_critic_target->pi->parameters()[i].copy_(target_pi_para[i]);
-//    }
-//    for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
-//        actor_critic_target->q1->parameters()[i].copy_(target_q1_para[i]);
-//    }
-//    for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
-//        actor_critic_target->q2->parameters()[i].copy_(target_q2_para[i]);
-//    }
-//    torch::AutoGradMode data_copy_enable(true);
-
-//    std::cout << actor_critic->pi->parameters() << std::endl
-//              << actor_critic->q1->parameters() << std::endl
-//              << actor_critic->q2->parameters() << std::endl
-//              << actor_critic_target->pi->parameters() << std::endl
-//              << actor_critic_target->q1->parameters() << std::endl
-//              << actor_critic_target->q2->parameters() << std::endl;
-
-//    return 0;
-
-//    torch::Tensor s_batch, a_batch, r_batch, d_batch, s2_batch;
-
-//    QString memoryp = QString(traindataPath + "/%1").arg(0);
-
-//    // Load values by name
-//    std::vector<char> f = get_the_bytes(QString(memoryp + "/state.pt").toStdString());
-//    torch::IValue stateI = torch::pickle_load(f);
-//    s_batch = stateI.toTensor().to(device);
-
-//    std::vector<char> f2 = get_the_bytes(QString(memoryp + "/action.pt").toStdString());
-//    torch::IValue actionI = torch::pickle_load(f2);
-//    a_batch = actionI.toTensor().to(device);
-
-//    std::vector<char> f3 = get_the_bytes(QString(memoryp + "/reward.pt").toStdString());
-//    torch::IValue rewardI = torch::pickle_load(f3);
-//    r_batch = rewardI.toTensor().to(device);
-
-//    std::vector<char> f4 = get_the_bytes(QString(memoryp + "/next_state.pt").toStdString());
-//    torch::IValue next_stateI = torch::pickle_load(f4);
-//    s2_batch = next_stateI.toTensor().to(device);
-
-//    std::vector<char> f5 = get_the_bytes(QString(memoryp + "/done.pt").toStdString());
-//    torch::IValue doneI = torch::pickle_load(f5);
-//    d_batch = doneI.toTensor().to(device);
-
-//    std::vector<float> tt{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8};
-//    s_batch = torch::from_blob(tt.data(), { 2, 4 }, at::kFloat);
-
-//    std::vector<float> tt2{0.1, 0.2};
-//    a_batch = torch::from_blob(tt2.data(), { 2, 1 }, at::kFloat);
-
-//    std::vector<float> tt3{0.2, 0.3};
-//    r_batch = torch::from_blob(tt3.data(), { 2, 1 }, at::kFloat);
-
-//    std::vector<float> tt4{0, 0};
-//    d_batch = torch::from_blob(tt4.data(), { 2, 1 }, at::kFloat);
-
-//    std::vector<float> tt5{0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1};
-//    s2_batch = torch::from_blob(tt5.data(), { 2, 4 }, at::kFloat);
-
-//    std::cout << "p para: " << std::endl << actor_critic->pi->parameters() << std::endl;
-//    std::cout << "q1 para: " << std::endl << actor_critic->q1->parameters() << std::endl;
-//    std::cout << "q2 para: " << std::endl << actor_critic->q2->parameters() << std::endl;
-
-//    // Q-value networks training
-//    //qDebug() << "Training Q-value networks";
-//    torch::AutoGradMode train_enable(true);
-
-//    torch::Tensor q1 = actor_critic->q1->forward(s_batch, a_batch);
-//    torch::Tensor q2 = actor_critic->q2->forward(s_batch, a_batch);
-
-//    torch::AutoGradMode disable(false);
-//    // Target actions come from *current* policy
-//    policy_output next_state_sample = actor_critic->pi->forward(s2_batch, false, true);
-//    torch::Tensor a2_batch = next_state_sample.action;
-//    torch::Tensor logp_a2 = next_state_sample.logp_pi;
-//    // Target Q-values
-//    torch::Tensor q1_pi_target = actor_critic_target->q1->forward(s2_batch, a2_batch);
-//    torch::Tensor q2_pi_target = actor_critic_target->q2->forward(s2_batch, a2_batch);
-//    torch::Tensor backup = r_batch + GAMMA * (1.0 - d_batch) * (torch::min(q1_pi_target, q2_pi_target) - ALPHA * logp_a2);
-
-//    // MSE loss against Bellman backup
-//    torch::AutoGradMode loss_enable(true);
-//    torch::Tensor loss_q1 = torch::mean(pow(q1 - backup, 2));
-//    torch::Tensor loss_q2 = torch::mean(pow(q2 - backup, 2));
-//    torch::Tensor loss_q = loss_q1 + loss_q2;
-
-//    critic_optimizer.zero_grad();
-//    loss_q.backward();
-//    critic_optimizer.step();
-
-//    std::cout << "q1: " << std::endl << q1 << std::endl;
-//    std::cout << "q2: " << std::endl << q2 << std::endl;
-//    std::cout << "a2: " << std::endl << a2_batch << std::endl;
-//    std::cout << "logp_a2: " << std::endl << logp_a2 << std::endl;
-//    std::cout << "q1_pi_targ: " << std::endl << q1_pi_target << std::endl;
-//    std::cout << "q2_pi_targ: " << std::endl << q2_pi_target << std::endl;
-//    std::cout << "backup: " << std::endl << backup << std::endl;
-//    std::cout << "loss_q1: " << std::endl << loss_q1 << std::endl;
-//    std::cout << "loss_q2: " << std::endl << loss_q2 << std::endl;
-
-//    std::cout << "p para: " << std::endl << actor_critic->pi->parameters() << std::endl;
-//    std::cout << "q1 para: " << std::endl << actor_critic->q1->parameters()<< std::endl;
-//    std::cout << "q2 para: " << std::endl << actor_critic->q2->parameters() << std::endl;
-
-//    // Policy network training
-//    //qDebug() << "Training policy network";
-
-//    for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
-//        actor_critic->q1->parameters()[i].set_requires_grad(false);
-//    }
-//    for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
-//        actor_critic->q2->parameters()[i].set_requires_grad(false);
-//    }
-
-//    policy_output sample = actor_critic->pi->forward(s_batch, false, true);
-//    torch::Tensor pi = sample.action;
-//    torch::Tensor log_pi = sample.logp_pi;
-//    torch::Tensor q1_pi = actor_critic->q1->forward(s_batch, pi);
-//    torch::Tensor q2_pi = actor_critic->q2->forward(s_batch, pi);
-//    torch::Tensor q_pi = torch::min(q1_pi, q2_pi);
-
-//    // Entropy-regularized policy loss
-//    torch::Tensor loss_pi = torch::mean(ALPHA * log_pi - q_pi); // Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
-
-//    policy_optimizer.zero_grad();
-//    loss_pi.backward();
-//    policy_optimizer.step();
-
-//    for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
-//        actor_critic->q1->parameters()[i].set_requires_grad(true);
-//    }
-//    for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
-//        actor_critic->q2->parameters()[i].set_requires_grad(true);
-//    }
-
-//    std::cout << "pi: " << std::endl << pi << std::endl;
-//    std::cout << "log_pi: " << std::endl << log_pi << std::endl;
-//    std::cout << "q1_pi: " << std::endl << q1_pi << std::endl;
-//    std::cout << "q2_pi: " << std::endl << q2_pi << std::endl;
-//    std::cout << "loss_pi: " << std::endl << loss_pi << std::endl;
-
-//    std::cout << "p para: " << std::endl << actor_critic->pi->parameters() << std::endl;
-//    std::cout << "q1 para: " << std::endl << actor_critic->q1->parameters()<< std::endl;
-//    std::cout << "q2 para: " << std::endl << actor_critic->q2->parameters() << std::endl;
-
-//    return 0;
-
-//    QString state_path = QString(testdataPath + "/%1/state.pt").arg(0);
-//    QString action_path = QString(testdataPath + "/%1/action.pt").arg(0);
-//    QString state_bach = QString(traindataPath + "/%1/state.pt").arg(0);
-//    // Load values by name
-//    std::vector<char> f = get_the_bytes(state_path.toStdString());
-//    torch::IValue state = torch::pickle_load(f);
-//    torch::Tensor statet = state.toTensor();
-
-//    std::vector<char> f2 = get_the_bytes(action_path.toStdString());
-//    torch::IValue action = torch::pickle_load(f2);
-//    torch::Tensor actiont = action.toTensor();
-
-//    std::vector<char> f3 = get_the_bytes(state_bach.toStdString());
-//    torch::IValue state2 = torch::pickle_load(f3);
-//    torch::Tensor statet2 = state2.toTensor();
-
-//    torch::Tensor testpiact = actor_critic->act(statet, false);
-//    policy_output testpi = actor_critic->pi->forward(statet2, false, true);
-//    auto a = testpi.action;
-//    auto pr = testpi.logp_pi;
-//    torch::Tensor testq1 = actor_critic->q1->forward(statet, actiont);
-//    torch::Tensor testq2 = actor_critic->q2->forward(statet, actiont);
-
-//    std::cout << "act: " << std::endl << testpiact << std::endl;
-//    std::cout << "pi action: " << std::endl << a << std::endl;
-//    std::cout << "pi prob: " << std::endl << pr << std::endl;
-//    std::cout << "q1: " << std::endl << testq1 << std::endl;
-//    std::cout << "q2: " << std::endl << testq2 << std::endl;
-
-//    return 0;
-
-//    torch::Tensor rand4_batch = torch::rand({5,4});
-//    torch::Tensor rand4 = torch::rand({4});
-//    torch::Tensor rand1 = torch::rand({1});
-
-//    torch::Tensor pout_test = actor_critic->act(rand4, true);
-//    std::cout << "p out test: " << std::endl << pout_test << std::endl << "------------------------------" << std::endl;
-
-//    policy_output pout_train = actor_critic->pi->forward(rand4_batch, false, true);
-//    std::cout << "p out train: " << std::endl << pout_train.action << std::endl << pout_train.logp_pi << std::endl << "------------------------------" << std::endl;
-
-//    torch::Tensor q1out = actor_critic->q1->forward(rand4, rand1);
-//    std::cout << "q1 out: " << std::endl << q1out << std::endl << "------------------------------" << std::endl;
-
-//    torch::Tensor q2out = actor_critic->q2->forward(rand4, rand1);
-//    std::cout << "q2 out: " << std::endl << q2out << std::endl << "------------------------------" << std::endl;
-
-//    return 0;
-
-//    policy->to(device);
-//    critic->to(device);
-//    target_critic->to(device);
-
-    int episode = 0;
-    int total_steps = 0;
-
-//    bool RestoreFromCheckpoint = false;
-//    if(RestoreFromCheckpoint){
-//        qDebug() << "Loading models";
-
-//        QString filename_episode_num = QString(memoryPath + "/episode_num.txt");
-//        std::vector<float> saved_episode_num;
-//        loaddata(filename_episode_num.toStdString(), saved_episode_num);
-//        episode = saved_episode_num[0]-1;
-//        maxepisode += episode;
-
-//        QString Pmodelname = QString(modelPath + "/policy_model_" + QString::number(episode) + ".pt");
-//        QString Poptimodelname = QString(modelPath + "/policy_optimizer_" + QString::number(episode) + ".pt");
-//        QString Cmodelname = QString(modelPath + "/critic__model_" + QString::number(episode) + ".pt");
-//        QString Coptimodelname = QString(modelPath + "/critic__optimizer_" + QString::number(episode) + ".pt");
-//        QString Cmodeltarget1name = QString(modelPath + "/critic_target__model_" + QString::number(episode) + ".pt");
-//        torch::load(actor_critic, Pmodelname.toStdString());
-//        torch::load(policy_optimizer, Poptimodelname.toStdString());
-//        torch::load(critic, Cmodelname.toStdString());
-//        torch::load(critic_optimizer, Coptimodelname.toStdString());
-//        torch::load(target_critic, Cmodeltarget1name.toStdString());
-//    } else {
-//        qDebug() << "Copying parameters to target models";
-//        torch::AutoGradMode hardcopy_disable(false);
-//        for(size_t i=0; i < target_critic->parameters().size(); i++){
-//            target_critic->parameters()[i].copy_(critic->parameters()[i]);
-//        }
-//    }
-
-    const std::string kLogFile = "/home/cpii/projects/log/test/Pendulum_v0_rand_eps/tfevents.pb";
-    GOOGLE_PROTOBUF_VERIFY_VERSION;
-    TensorBoardLogger logger(kLogFile.c_str());
-
-    std::vector<int> teststeps;
-    for(int i=0; i<100; i++){
-        teststeps.push_back(i*2000);
-    }
-    int total_teststeps = 0;
-
-    while(episode < maxepisode){
-        qDebug() << "\033[0;35m--------------------------------------------" << "\n";
-        qDebug() << "Episode" << episode << "start\033[0m";
-        qDebug() << "Step: [" << total_steps << "/" << traincount << "]";
-        int step = 0, train_number = 0, tmp = 0;
-        bool done = false;
-        float episode_critic1_loss = 0, episode_critic2_loss = 0, episode_policy_loss = 0, episode_reward = 0;
-
-        std::cout << "p para: " << std::endl << actor_critic->pi->parameters()[0].mean() << std::endl;
-        //std::cout << "mean para: " << std::endl << actor_critic->pi->mean_linear->parameters()[0].mean() << std::endl;
-        std::cout << "q1 para: " << std::endl << actor_critic->q1->parameters()[0].mean() << std::endl;
-        std::cout << "q2 para: " << std::endl << actor_critic->q2->parameters()[0].mean() << std::endl;
-
-        // Reset Environment
-
-        torch::Tensor pmean;
-
-        while(step < maxstep){
-            //qDebug() << "\033[0;35m--------------------------------------------";
-            //qDebug() << "Episode" << episode << ", Step[" << step << "/" << maxstep << "] start\033[0m";
-            //qDebug() << "Total step: [" << total_steps << "/" << traincount << "]";
-            float reward = 0;
-            torch::Tensor state, action, after_state;
-
-//            std::cout << "p para: " << std::endl << actor_critic->pi->parameters()[0].mean() << std::endl;
-//            std::cout << "mean para: " << std::endl << actor_critic->pi->mean_linear->parameters()[0].mean() << std::endl;
-//            std::cout << "q1 para: " << std::endl << actor_critic->q1->parameters()[0].mean() << std::endl;
-//            std::cout << "q2 para: " << std::endl << actor_critic->q2->parameters()[0].mean() << std::endl;
-
-//            if(total_steps>1 && pmean.item().toFloat() == actor_critic->pi->parameters()[0].mean().item().toFloat()){
-//                qDebug() << total_steps;
-//                break;
-//            }
-
-//            pmean = actor_critic->pi->parameters()[0].mean();
-
-//            if(total_steps+1>traincount){
-//                break;
-//            }
-
-            // Do action
-
-
-            // After state & reward
-
-            // Test reward
-
-            //done = env d;
-            //after_state = env after_state;
-
-            // Train models
-            //if(memory.size() > batch_size){
-                torch::Tensor s_batch, a_batch, r_batch, d_batch, s2_batch;
-
-                QString memoryp = QString(traindataPath + "/%1").arg(total_steps);
-
-                // Load values by name
-                std::vector<char> f = get_the_bytes(QString(memoryp + "/state.pt").toStdString());
-                torch::IValue stateI = torch::pickle_load(f);
-                s_batch = stateI.toTensor().to(device);
-
-                std::vector<char> f2 = get_the_bytes(QString(memoryp + "/action.pt").toStdString());
-                torch::IValue actionI = torch::pickle_load(f2);
-                a_batch = actionI.toTensor().to(device);
-
-                std::vector<char> f3 = get_the_bytes(QString(memoryp + "/reward.pt").toStdString());
-                torch::IValue rewardI = torch::pickle_load(f3);
-                r_batch = rewardI.toTensor().to(device);
-
-                std::vector<char> f4 = get_the_bytes(QString(memoryp + "/next_state.pt").toStdString());
-                torch::IValue next_stateI = torch::pickle_load(f4);
-                s2_batch = next_stateI.toTensor().to(device);
-
-                std::vector<char> f5 = get_the_bytes(QString(memoryp + "/done.pt").toStdString());
-                torch::IValue doneI = torch::pickle_load(f5);
-                d_batch = doneI.toTensor().to(device);
-
-
-                // Q-value networks training
-                //qDebug() << "Training Q-value networks";
-                torch::AutoGradMode q_enable(true);
-
-                torch::Tensor q1 = actor_critic->q1->forward(s_batch, a_batch);
-                torch::Tensor q2 = actor_critic->q2->forward(s_batch, a_batch);
-
-                torch::AutoGradMode disable(false);
-                // Target actions come from *current* policy
-                policy_output next_state_sample = actor_critic->pi->forward(s2_batch, false, true);
-                torch::Tensor a2_batch = next_state_sample.action;
-                torch::Tensor logp_a2 = next_state_sample.logp_pi;
-                // Target Q-values
-                torch::Tensor q1_pi_target = actor_critic_target->q1->forward(s2_batch, a2_batch);
-                torch::Tensor q2_pi_target = actor_critic_target->q2->forward(s2_batch, a2_batch);
-                torch::Tensor backup = r_batch + GAMMA * (1.0 - d_batch) * (torch::min(q1_pi_target, q2_pi_target) - ALPHA * logp_a2);
-
-                // MSE loss against Bellman backup
-                torch::AutoGradMode loss_enable(true);
-                torch::Tensor loss_q1 = torch::mean(pow(q1 - backup, 2));
-                torch::Tensor loss_q2 = torch::mean(pow(q2 - backup, 2));
-                torch::Tensor loss_q = loss_q1 + loss_q2;
-
-                episode_critic1_loss += loss_q1.detach().item().toFloat();
-                episode_critic2_loss += loss_q2.detach().item().toFloat();
-
-                critic_optimizer.zero_grad();
-                loss_q.backward();
-                critic_optimizer.step();
-
-                // Policy network training
-                //qDebug() << "Training policy network";
-
-                for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
-                    actor_critic->q1->parameters()[i].set_requires_grad(false);
-                }
-                for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
-                    actor_critic->q2->parameters()[i].set_requires_grad(false);
-                }
-
-                policy_output sample = actor_critic->pi->forward(s_batch, false, true);
-                torch::Tensor pi = sample.action;
-                torch::Tensor log_pi = sample.logp_pi;
-                torch::Tensor q1_pi = actor_critic->q1->forward(s_batch, pi);
-                torch::Tensor q2_pi = actor_critic->q2->forward(s_batch, pi);
-                torch::Tensor q_pi = torch::min(q1_pi, q2_pi);
-
-                // Entropy-regularized policy loss
-                torch::Tensor loss_pi = torch::mean(ALPHA * log_pi - q_pi); // Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
-
-                episode_policy_loss += loss_pi.detach().item().toFloat();
-
-                policy_optimizer.zero_grad();
-                loss_pi.backward();
-                policy_optimizer.step();
-
-                for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
-                    actor_critic->q1->parameters()[i].set_requires_grad(true);
-                }
-                for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
-                    actor_critic->q2->parameters()[i].set_requires_grad(true);
-                }
-
-
-                // Update target networks
-                //qDebug() << "Updating target models";
-                torch::AutoGradMode softcopy_disable(false);
-                for (size_t i = 0; i < actor_critic_target->pi->parameters().size(); i++) {
-                    actor_critic_target->pi->parameters()[i].mul_(POLYAK);
-                    actor_critic_target->pi->parameters()[i].add_((1.0 - POLYAK) * actor_critic->pi->parameters()[i]);
-                }
-                for (size_t i = 0; i < actor_critic_target->q1->parameters().size(); i++) {
-                    actor_critic_target->q1->parameters()[i].mul_(POLYAK);
-                    actor_critic_target->q1->parameters()[i].add_((1.0 - POLYAK) * actor_critic->q1->parameters()[i]);
-                }
-                for (size_t i = 0; i < actor_critic_target->q2->parameters().size(); i++) {
-                    actor_critic_target->q2->parameters()[i].mul_(POLYAK);
-                    actor_critic_target->q2->parameters()[i].add_((1.0 - POLYAK) * actor_critic->q2->parameters()[i]);
-                }
-                torch::AutoGradMode softcopy_enable(true);
-
-                train_number++;
-            //}
-
-//            memory.push_back({
-
-//                             });
-
-//            if(done){
-//                break;
-//            }
-
-            step++;
-            total_steps++;
-        }
-
-        // Test model
-        int teststep = teststeps[episode] - total_teststeps;
-        for(int i=0; i<teststep; i++){
-            if(i+total_teststeps>testcount){
-                break;
+            if (torch::cuda::is_available()) {
+                std::cout << "CUDA is available! Training on GPU." << std::endl;
+                device = torch::Device(torch::kCUDA);
             }
-            QString state_path = QString(testdataPath + "/%1/state.pt").arg(i + total_teststeps);
-            QString action_path = QString(testdataPath + "/%1/action.pt").arg(i + total_teststeps);
-            // Load values by name
-            std::vector<char> f = get_the_bytes(state_path.toStdString());
-            torch::IValue state = torch::pickle_load(f);
-            torch::Tensor statet = state.toTensor();
 
-            std::vector<char> f2 = get_the_bytes(action_path.toStdString());
-            torch::IValue action = torch::pickle_load(f2);
-            torch::Tensor actiond = action.toTensor();
+            torch::autograd::DetectAnomalyGuard detect_anomaly;
 
-            torch::Tensor actionp = actor_critic->act(statet, true);
+            qDebug() << "Creating models";
 
-            float reward = -torch::sum(abs(actionp - actiond)).item().toFloat();
+            std::vector<int> policy_mlp_dims{STATE_DIM, 128, 128};
+            std::vector<int> critic_mlp_dims{STATE_DIM + ACT_DIM, 128, 128};
 
-            episode_reward += reward;
-            //std::cout << "ad: " << actiond << std::endl << "ap: " << actionp << std::endl;
-            //std::cout << "reward: " << std::endl << reward << std::endl;
-            //std::cout << "state: " << std::endl << state << std::endl;
+            auto actor_critic = ActorCritic(policy_mlp_dims, critic_mlp_dims);
+            auto actor_critic_target = ActorCritic(policy_mlp_dims, critic_mlp_dims);
+
+            qDebug() << "Creating optimizer";
+
+            torch::AutoGradMode copy_disable(false);
+
+            std::vector<torch::Tensor> q_params;
+            for(size_t i=0; i<actor_critic->q1->parameters().size(); i++){
+                q_params.push_back(actor_critic->q1->parameters()[i]);
+            }
+            for(size_t i=0; i<actor_critic->q2->parameters().size(); i++){
+                q_params.push_back(actor_critic->q2->parameters()[i]);
+            }
+
+            for(size_t i=0; i < actor_critic_target->pi->parameters().size(); i++){
+                actor_critic_target->pi->parameters()[i].copy_(actor_critic->pi->parameters()[i]);
+                actor_critic_target->pi->parameters()[i].set_requires_grad(false);
+            }
+            for(size_t i=0; i < actor_critic_target->q1->parameters().size(); i++){
+                actor_critic_target->q1->parameters()[i].copy_(actor_critic->q1->parameters()[i]);
+                actor_critic_target->q1->parameters()[i].set_requires_grad(false);
+            }
+            for(size_t i=0; i < actor_critic_target->q2->parameters().size(); i++){
+                actor_critic_target->q2->parameters()[i].copy_(actor_critic->q2->parameters()[i]);
+                actor_critic_target->q2->parameters()[i].set_requires_grad(false);
+            }
+
+            torch::AutoGradMode copy_enable(true);
+
+            torch::optim::Adam policy_optimizer(actor_critic->pi->parameters(), torch::optim::AdamOptions(lrp));
+            torch::optim::Adam critic_optimizer(q_params, torch::optim::AdamOptions(lrc));
+
+            actor_critic->pi->to(device);
+            actor_critic->q1->to(device);
+            actor_critic->q2->to(device);
+            actor_critic_target->pi->to(device);
+            actor_critic_target->q1->to(device);
+            actor_critic_target->q2->to(device);
+
+            int episode = 0, total_steps = 0;
+            float test_reward = 0;
+
+            int thickness = -1;
+
+            GOOGLE_PROTOBUF_VERIFY_VERSION;
+            TensorBoardLogger logger(kLogFile.c_str());
+
+            while(episode < maxepisode){
+                //qDebug() << "\033[0;35m--------------------------------------------" << "\n";
+                //qDebug() << "Episode" << episode << "start";
+                //qDebug() << "Step: [" << total_steps << "]\033[0m";
+                int step = 0;
+                torch::Tensor state, after_state, action, reward, done;
+                float episode_critic1_loss = 0, episode_critic2_loss = 0, episode_policy_loss = 0, episode_reward = 0;
+
+                //std::cout << "p para: " << std::endl << actor_critic->state, pi->parameters()[0].mean() << std::endl;
+                //std::cout << "mean para: " << std::endl << actor_critic->pi->mean_linear->parameters()[0].mean() << std::endl;
+                //std::cout << "q1 para: " << std::endl << actor_critic->q1->parameters()[0].mean() << std::endl;
+                //std::cout << "q2 para: " << std::endl << actor_critic->q2->parameters()[0].mean() << std::endl;
+
+                // Reset Environment
+                state = Env.reset();
+                state = torch::unsqueeze(state.clone().detach(), 0);
+
+                while(step < maxstep){
+                    //qDebug() << "\033[0;35m--------------------------------------------";
+                    //qDebug() << "Episode" << episode << ", Step [" << step << "/" << maxstep << "] start";
+                    //qDebug() << "Total step: [" << total_steps << "]\033[0m";
+
+                    torch::AutoGradMode enable(true);
+                    if(total_steps < START_STEP){
+                        action = Env.sample_action();
+                    } else {
+                        auto state_device = state.detach().clone().to(device);
+                        action = actor_critic->act(state_device, false);
+                        action = action.squeeze(0).to(torch::kCPU);
+                        //std::cout << action;
+                    }
+
+                    auto out = Env.step(action);
+                    after_state = std::get<0>(out);
+                    reward = std::get<1>(out);
+                    done = std::get<2>(out);
+
+                    episode_reward += reward.detach().item().toFloat();
+
+//                    torch::Tensor out_tensor = after_state;
+//                    out_tensor = out_tensor.permute({1, 2, 0})*255;
+//                    out_tensor = out_tensor.toType(torch::kByte);
+//                    cv::Mat cv_mat(128, 128, CV_8UC3, out_tensor.data_ptr<uchar>());
+//                    QString filename_id = QString("/home/cpii/Desktop/1d_vision_test_img/");
+//                    QDir().mkdir(filename_id);
+//                    QString filename_before_image = QString(filename_id + "/RGB%1.jpg").arg(step);
+//                    QByteArray filename_before_imageqb = filename_before_image.toLocal8Bit();
+//                    const char *filename_before_imagechar = filename_before_imageqb.data();
+//                    cv::imwrite(filename_before_imagechar, cv_mat);
+
+                    after_state = torch::unsqueeze(after_state.clone().detach(), 0);
+                    action = torch::unsqueeze(action.clone().detach(), 0);
+                    reward = torch::unsqueeze(reward.clone().detach(), 0);
+                    done = torch::unsqueeze(done.clone().detach(), 0);
+
+                    if (memory.size() >= 10000) {
+                        memory.pop_front();
+                    }
+
+                    memory.push_back({
+                        state.clone().detach().to(device),
+                        after_state.clone().detach().to(device),
+                        action.clone().detach().to(device),
+                        reward.clone().detach().to(device),
+                        done.clone().detach().to(device),
+                    });
+
+                    state = after_state.clone().detach();
+
+                    if(memory.size() > batch_size){
+                        int randomnum = rand()%(memory.size() - batch_size + 1);
+
+                        torch::Tensor s_batch, s2_batch, a_batch, r_batch, d_batch;
+
+                        s_batch = memory[randomnum].before_state.clone().detach();
+                        s2_batch = memory[randomnum].after_state.clone().detach();
+                        a_batch = memory[randomnum].action.clone().detach();
+                        r_batch = memory[randomnum].reward.clone().detach();
+                        d_batch = memory[randomnum].done.clone().detach();
+                        for (int i = 1; i < batch_size; i++) {
+                            s_batch = torch::cat({ s_batch, memory[randomnum+i].before_state.clone().detach() }, 0);
+                            s2_batch = torch::cat({ s2_batch, memory[randomnum+i].after_state.clone().detach() }, 0);
+                            a_batch = torch::cat({ a_batch, memory[randomnum+i].action.clone().detach() }, 0);
+                            r_batch = torch::cat({ r_batch, memory[randomnum+i].reward.clone().detach() }, 0);
+                            d_batch = torch::cat({ d_batch, memory[randomnum+i].done.clone().detach() }, 0);
+                        }
+
+                        // Q-value networks training
+                        //qDebug() << "Training Q-value networks";
+                        torch::AutoGradMode q_enable(true);
+                        torch::Tensor q1 = actor_critic->q1->forward(s_batch, a_batch);
+                        torch::Tensor q2 = actor_critic->q2->forward(s_batch, a_batch);
+
+                        torch::AutoGradMode disable(false);
+                        // Target actions come from *current* policy
+                        policy_output next_state_sample = actor_critic->pi->forward(s2_batch, false, true);
+                        torch::Tensor a2_batch = next_state_sample.action;
+                        torch::Tensor logp_a2 = next_state_sample.logp_pi;
+
+                        // Target Q-values
+                        torch::Tensor q1_pi_target = actor_critic_target->q1->forward(s2_batch, a2_batch);
+                        torch::Tensor q2_pi_target = actor_critic_target->q2->forward(s2_batch, a2_batch);
+                        torch::Tensor backup = r_batch + GAMMA * (1.0 - d_batch) * (torch::min(q1_pi_target, q2_pi_target) - ALPHA * logp_a2);
+
+                        // MSE loss against Bellman backup
+                        torch::AutoGradMode loss_enable(true);
+                        torch::Tensor loss_q1 = torch::mean(pow(q1 - backup, 2)); // JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
+                        torch::Tensor loss_q2 = torch::mean(pow(q2 - backup, 2));
+//                        std::cout << backup.sizes() << std::endl
+//                                  << r_batch.sizes() << std::endl
+//                                  << q1_pi_target.sizes() << std::endl
+//                                  << logp_a2.sizes() << std::endl
+//                                  << q1.sizes() << std::endl;
+                        //torch::Tensor loss_q1 = torch::nn::functional::mse_loss(q1, backup);
+                        //torch::Tensor loss_q2 = torch::nn::functional::mse_loss(q2, backup);
+                        torch::Tensor loss_q = loss_q1 + loss_q2;
+
+                        episode_critic1_loss += loss_q1.detach().item().toFloat();
+                        episode_critic2_loss += loss_q2.detach().item().toFloat();
+
+                        critic_optimizer.zero_grad();
+                        loss_q.backward();
+                        critic_optimizer.step();
+
+                        // Policy network training
+                        //qDebug() << "Training policy network";
+
+                        for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
+                            actor_critic->q1->parameters()[i].set_requires_grad(false);
+                        }
+                        for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
+                            actor_critic->q2->parameters()[i].set_requires_grad(false);
+                        }
+
+                        policy_output sample = actor_critic->pi->forward(s_batch, false, true);
+                        torch::Tensor pi = sample.action;
+                        torch::Tensor log_pi = sample.logp_pi;
+                        torch::Tensor q1_pi = actor_critic->q1->forward(s_batch, pi);
+                        torch::Tensor q2_pi = actor_critic->q2->forward(s_batch, pi);
+                        torch::Tensor q_pi = torch::min(q1_pi, q2_pi);
+
+                        // Entropy-regularized policy loss
+                        torch::Tensor loss_pi = torch::mean(ALPHA * log_pi - q_pi); // Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
+
+                        episode_policy_loss += loss_pi.detach().item().toFloat();
+
+                        policy_optimizer.zero_grad();
+                        loss_pi.backward();
+                        policy_optimizer.step();
+
+                        for(size_t i=0; i < actor_critic->q1->parameters().size(); i++){
+                            actor_critic->q1->parameters()[i].set_requires_grad(true);
+                        }
+                        for(size_t i=0; i < actor_critic->q2->parameters().size(); i++){
+                            actor_critic->q2->parameters()[i].set_requires_grad(true);
+                        }
+
+                        // Update target networks
+                        torch::AutoGradMode softcopy_disable(false);
+                        for (size_t i = 0; i < actor_critic_target->pi->parameters().size(); i++) {
+                            actor_critic_target->pi->parameters()[i].mul_(POLYAK);
+                            actor_critic_target->pi->parameters()[i].add_((1.0 - POLYAK) * actor_critic->pi->parameters()[i]);
+                        }
+                        for (size_t i = 0; i < actor_critic_target->q1->parameters().size(); i++) {
+                            actor_critic_target->q1->parameters()[i].mul_(POLYAK);
+                            actor_critic_target->q1->parameters()[i].add_((1.0 - POLYAK) * actor_critic->q1->parameters()[i]);
+                        }
+                        for (size_t i = 0; i < actor_critic_target->q2->parameters().size(); i++) {
+                            actor_critic_target->q2->parameters()[i].mul_(POLYAK);
+                            actor_critic_target->q2->parameters()[i].add_((1.0 - POLYAK) * actor_critic->q2->parameters()[i]);
+                        }
+                        torch::AutoGradMode softcopy_enable(true);
+                    }
+                    step++;
+                    total_steps++;
+
+                    bool _done = done.detach().item().toFloat();
+                    if(_done){
+                        std::cout << "Done! Episode steps: " << step << std::endl;
+                        break;
+                    }
+                }
+                episode++;
+
+                // Test model
+                int teststep = 0;
+                if(episode%20 == 0){
+                    test_reward = 0;
+                    torch::AutoGradMode test_disable(false);
+                    actor_critic->pi->eval();
+                    for(int test_episode=0; test_episode < total_test_episode; test_episode++){
+                        state = Env.reset();
+                        for(int test_step = 0; test_step < maxstep; test_step++){
+                            auto state_device = state.detach().clone().to(device);
+                            action = actor_critic->act(torch::unsqueeze(state_device, 0), true);
+                            action = action.squeeze(0).to(torch::kCPU);
+
+                            auto out = Env.step(action);
+                            after_state = std::get<0>(out);
+                            reward = std::get<1>(out);
+                            done = std::get<2>(out);
+
+                            state = after_state.clone().detach();
+
+                            test_reward += reward.detach().item().toFloat();
+
+                            teststep++;
+
+                            bool _done = done.detach().item().toFloat();
+                            if(_done){
+                                break;
+                            }
+                        }
+                    }
+                    test_reward /= total_test_episode;
+                    torch::AutoGradMode test_enable(true);
+                    actor_critic->pi->train();
+                }
+
+                // Save
+                episode_critic1_loss = episode_critic1_loss / (float)step;
+                episode_critic2_loss = episode_critic2_loss / (float)step;
+                episode_policy_loss = episode_policy_loss / (float)step;
+
+                qDebug() << "\033[0;35m--------------------------------------------" << "\n"
+                    << "Episode: " << episode << "\n"
+                    << "Episode Step: " << step << "\n"
+                    << "Total Step: " << total_steps << "\n"
+                    << "Reward: " << episode_reward << "\n"
+                    << "Critic_1 Loss: " << episode_critic1_loss << "\n"
+                    << "Critic_2 Loss: " << episode_critic2_loss << "\n"
+                    << "Policy Loss: " << episode_policy_loss << "\n"
+                    << "Test Reward: " << test_reward << "\n"
+                    << "--------------------------------------------\033[0m";
+                logger.add_scalar("Episode_Reward", episode, episode_reward);
+                logger.add_scalar("Episode_Critic1_Loss", episode, episode_critic1_loss);
+                logger.add_scalar("Episode_Critic2_Loss", episode, episode_critic2_loss);
+                logger.add_scalar("Episode_Policy_Loss", episode, episode_policy_loss);
+                logger.add_scalar("Test_Reward", episode, test_reward);
+
+                int save = SAVEMODELEVERY;
+                if (episode % save == 0 || (!gg && episode_reward >= 500)) {
+                    qDebug() << "Saving memory";
+                    if (!gg && episode_reward >= 500) {
+                        gg = true;
+                    }
+//                    for(int i=0; i <memory.size(); i++){
+//                        QString filename_id = QString(memoryPath + "/%1").arg(i);
+//                        QDir().mkdir(filename_id);
+
+//                        auto before_state_CPU = memory[i].before_state.clone().detach().to(torch::kCPU);
+//                        QString filename_before_state = QString(filename_id + "/before_state.pt");
+//                        torch::save(before_state_CPU, filename_before_state.toStdString());
+
+//                        auto after_state_CPU = memory[i].after_state.clone().detach().to(torch::kCPU);
+//                        QString filename_after_state = QString(filename_id + "/after_state.pt");
+//                        torch::save(after_state_CPU, filename_after_state.toStdString());
+
+//                        auto action_CPU = memory[i].action.clone().detach().to(torch::kCPU);
+//                        QString filename_action = QString(filename_id + "/action.pt");
+//                        torch::save(action_CPU, filename_action.toStdString());
+
+//                        auto reward_CPU = memory[i].reward.clone().detach().to(torch::kCPU);
+//                        QString filename_reward = QString(filename_id + "/reward.pt");
+//                        torch::save(reward_CPU, filename_reward.toStdString());
+
+//                        auto done_CPU = memory[i].done.clone().detach().to(torch::kCPU);
+//                        QString filename_done = QString(filename_id + "/done.pt");
+//                        torch::save(done_CPU, filename_done.toStdString());
+//                    }
+
+                    qDebug() << "Saving models";
+
+                    QString pi_para_path = QString(modelPath + "/pi_para/pi_para_" + QString::number(episode) + ".pt");
+                    QString q1_para_path = QString(modelPath + "/q1_para/q1_para_" + QString::number(episode) + ".pt");
+                    QString q2_para_path = QString(modelPath + "/q2_para/q2_para_" + QString::number(episode) + ".pt");
+                    QString target_pi_para_path = QString(modelPath + "/target_pi_para/target_pi_para_" + QString::number(episode) + ".pt");
+                    QString target_q1_para_path = QString(modelPath + "/target_q1_para/target_q1_para_" + QString::number(episode) + ".pt");
+                    QString target_q2_para_path = QString(modelPath + "/target_q2_para/target_q2_para_" + QString::number(episode) + ".pt");
+                    QString policy_opti_path = QString(modelPath + "/policy_optimizer/policy_optimizer_" + QString::number(episode) + ".pt");
+                    QString critic_opti_path = QString(modelPath + "/critic_optimizer/critic_optimizer_" + QString::number(episode) + ".pt");
+
+                    torch::save(actor_critic->pi->parameters(), pi_para_path.toStdString());
+                    torch::save(actor_critic->q1->parameters(), q1_para_path.toStdString());
+                    torch::save(actor_critic->q2->parameters(), q2_para_path.toStdString());
+                    torch::save(actor_critic_target->pi->parameters(), target_pi_para_path.toStdString());
+                    torch::save(actor_critic_target->q1->parameters(), target_q1_para_path.toStdString());
+                    torch::save(actor_critic_target->q2->parameters(), target_q2_para_path.toStdString());
+                    torch::save(policy_optimizer, policy_opti_path.toStdString());
+                    torch::save(critic_optimizer, critic_opti_path.toStdString());
+
+                    std::vector<float> save_episode_num;
+                    save_episode_num.push_back(episode);
+                    QString filename_episode_num = QString(memoryPath + "/episode_num.txt");
+                    savedata(filename_episode_num, save_episode_num);
+
+                    std::vector<float> totalsteps;
+                    totalsteps.push_back(total_steps);
+                    QString filename_totalsteps = QString(memoryPath + "/totalsteps.txt");
+                    savedata(filename_totalsteps, totalsteps);
+
+                    qDebug() << "Models saved";
+                }
+
+                qDebug() << "\033[0;34mEpisode " << episode << "finished\033[0m\n"
+                         << "--------------------------------------------";
+            }
+            mTraining = false;
+        } catch (const std::exception &e) {
+            auto &&msg = torch::GetExceptionString(e);
+            qWarning() << msg.c_str();
+        } catch (...) {
+            qCritical() << "GG";
         }
-        total_teststeps += teststep;
-
-        // Save
-        episode++;
-
-        episode_critic1_loss = episode_critic1_loss / (float)train_number;
-        episode_critic2_loss = episode_critic2_loss / (float)train_number;
-        episode_policy_loss = episode_policy_loss / (float)train_number;
-
-        qDebug() << "\033[0;35m--------------------------------------------" << "\n"
-            << "Episode: " << episode << "\n"
-            //<< "Done(1:yes, 0:no): " << done << "\n"
-            << "Reward: " << episode_reward << "\n"
-            << "Critic_1 Loss: " << episode_critic1_loss << "\n"
-            << "Critic_2 Loss: " << episode_critic2_loss << "\n"
-            << "Policy Loss: " << episode_policy_loss << "\n"
-            << "--------------------------------------------\033[0m";
-        logger.add_scalar("Episode_Reward", episode, episode_reward);
-        logger.add_scalar("Episode_Critic1_Loss", episode, episode_critic1_loss);
-        logger.add_scalar("Episode_Critic2_Loss", episode, episode_critic2_loss);
-        logger.add_scalar("Episode_Policy_Loss", episode, episode_policy_loss);
-
-//        if (episode % 50 == 0) {
-//            qDebug() << "Saving models";
-//            QString Pmodelname = QString(modelPath + "/policy_model_" + QString::number(episode) + ".pt");
-//            QString Poptimodelname = QString(modelPath + "/policy_optimizer_" + QString::number(episode) + ".pt");
-//            QString Cmodelname = QString(modelPath + "/critic_model_" + QString::number(episode) + ".pt");
-//            QString Coptimodelname = QString(modelPath + "/critic_optimizer_" + QString::number(episode) + ".pt");
-//            QString Cmodeltargetname = QString(modelPath + "/critic_target_model_" + QString::number(episode) + ".pt");
-//            torch::save(policy, Pmodelname.toStdString());
-//            torch::save(policy_optimizer, Poptimodelname.toStdString());
-//            torch::save(critic, Cmodelname.toStdString());
-//            torch::save(critic_optimizer, Coptimodelname.toStdString());
-//            torch::save(target_critic, Cmodeltargetname.toStdString());
-
-//            std::vector<float> save_episode_num;
-//            save_episode_num.push_back(episode+1);
-//            QString filename_episode_num = QString(memoryPath + "/episode_num.txt");
-//            savedata(filename_episode_num, save_episode_num);
-
-//            std::vector<float> save_total_steps;
-//            save_total_steps.push_back(total_steps);
-//            QString filename_totalsteps = QString(memoryPath + "/total_steps.txt");
-//            savedata(filename_totalsteps, save_total_steps);
-//            qDebug() << "Models saved";
-//        }
-
-        qDebug() << "\033[0;34mEpisode " << episode << "finished\033[0m\n"
-                 << "--------------------------------------------";
-
-//        if(pmean.item().toFloat() == actor_critic->pi->parameters()[0].mean().item().toFloat()){
-//            qDebug() << total_steps;
-//            break;
-//        }
-
-        if(total_steps+1>traincount){
-            qDebug() << "Finished";
-            break;
-        }
-
-    }
-
-    return 0;
+    });
 }
